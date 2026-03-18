@@ -26,8 +26,13 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.0-devel-ubuntu22.04",
+        add_python="3.12",
+    )
+    .env({"CUDA_HOME": "/usr/local/cuda"})
+    .apt_install("ninja-build")
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "apache-tvm-ffi")
 )
 
 
@@ -36,7 +41,21 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
-
+    # === Debug: Try to compile the solution first to get detailed error ===
+    try:
+        from flashinfer_bench.compile import BuilderRegistry
+        trace_set = TraceSet.from_path(TRACE_SET_PATH)
+        if solution.definition in trace_set.definitions:
+            definition = trace_set.definitions[solution.definition]
+            registry = BuilderRegistry.get_instance()
+            print("[DEBUG] Attempting to build solution...")
+            runnable = registry.build(definition, solution)
+            print(f"[DEBUG] Build succeeded! Runnable: {runnable}")
+    except Exception as e:
+        print(f"[DEBUG] Build failed with error:\n{e}")
+        import traceback
+        traceback.print_exc()
+    # === End debug ===
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
     if solution.definition not in trace_set.definitions:
