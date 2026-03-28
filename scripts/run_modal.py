@@ -40,7 +40,14 @@ image = (
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(warmup_runs=5, iterations=10, num_trials=1)
+    # Clear build cache to avoid stale compiled kernels
+    import shutil, os
+    cache_dir = "/root/.cache/flashinfer_bench/cache"
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+        print("[DEBUG] Cleared build cache")
+
     # === Debug: Try to compile the solution first to get detailed error ===
     try:
         from flashinfer_bench.compile import BuilderRegistry
@@ -67,10 +74,22 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
+    # workloads = workloads[:10]
+
+    # Only test FlashInfer baseline
+    # baseline_solutions = trace_set.solutions.get(solution.definition, [])
+    # print(f"Found {len(baseline_solutions)} baseline solution(s): {[s.name for s in baseline_solutions]}")
+    # all_solutions = baseline_solutions
+
+    # Test our solution
+    all_solutions = [solution]
+    print(f"Testing {len(all_solutions)} solution(s): {[s.name for s in all_solutions]}")
+
+
     bench_trace_set = TraceSet(
         root=trace_set.root,
         definitions={definition.name: definition},
-        solutions={definition.name: [solution]},
+        solutions={definition.name: all_solutions},
         workloads={definition.name: workloads},
         traces={definition.name: []},
     )
@@ -85,7 +104,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         if trace.evaluation:
             entry = {
                 "status": trace.evaluation.status.value,
-                "solution": trace.solution,
+                "solution": trace.solution if isinstance(trace.solution, str) else getattr(trace, 'solution', ''),
             }
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
@@ -105,7 +124,8 @@ def print_results(results: dict):
         print(f"\n{def_name}:")
         for workload_uuid, result in traces.items():
             status = result.get("status")
-            print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
+            sol_name = result.get("solution", "")
+            print(f"  [{sol_name}] Workload {workload_uuid[:8]}...: {status}", end="")
 
             if result.get("latency_ms") is not None:
                 print(f" | {result['latency_ms']:.3f} ms", end="")

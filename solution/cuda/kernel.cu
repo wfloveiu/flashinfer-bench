@@ -1,34 +1,19 @@
 /*
- * Fused DeltaNet Recurrent State Update - CUDA Warp-Cooperative Kernel
- * Adapted for FlashInfer-Bench with TVM FFI bindings.
+ * Fused DeltaNet Recurrent State Update - CUDA
  *
- * Fully fused: raw gate parameters (A_log, a, dt_bias, b) are computed
- * inside the kernel — zero host-side overhead.
- *
- * DeltaNet linear attention recurrence (per head, per decode step):
- *     x = a + dt_bias
- *     log_decay = -exp(A_log) * softplus(x)
- *     decay = exp(log_decay)
- *     beta = sigmoid(b)
- *
- *     S *= decay                          // gate decay
- *     residual = v - S^T @ k              // delta rule residual
- *     delta = beta * residual
- *     S += outer(delta, k)                // rank-1 state update
- *     o = S^T @ q                         // output query
+ * Best-of-breed design combining all proven optimizations:
+ *   1. float4 (128-bit) vectorized state load/store
+ *   2. uint2 (64-bit) vectorized q/k/v bf16 loads
+ *   3. 4 warps per block — higher occupancy without smem overhead
+ *   4. No shared memory, no __syncthreads — warps fully independent
+ *   5. Each warp loads its own q/k into registers (256B bf16 = trivial)
+ *   6. Grid: (NV_BLOCKS, B*HV) — maximum block-level parallelism
  *
  * State layout: [B, HV, V, K] (k-last, K contiguous) — f32
  *
- * Warp-cooperative design:
- *   - 1 block = 1 warp = 32 threads
- *   - Each block handles BV v-rows (BV=4)
- *   - Each thread handles BV * (K/32) = 4 * 4 = 16 f32 state elements
- *   - Reductions (dot products) use __shfl_xor_sync warp shuffles
- *   - q, k vectors in shared memory (256 f32 = 1KB)
- *   - No __syncthreads needed — single warp guarantees lockstep
- *
- * Grid: (NV, B * HV) where NV = V / BV
- * Block: 32 threads (1 warp)
+ * Grid: (V/(4*BV), B*HV) = (8, B*8)
+ * Block: 128 threads (4 warps x 32 lanes)
+ * Each warp: BV=4 v-rows, KPT=4 floats/thread
  */
 
 #include <cuda_runtime.h>
@@ -41,12 +26,14 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/error.h>
 
-// Compile-time dimensions
-constexpr int K_DIM = 128;    // full K dimension
-constexpr int V_DIM = 128;    // full V dimension
-constexpr int WARP_SIZE = 32; // threads per warp
-constexpr int BV = 4;         // v-rows per block
-constexpr int KPT = K_DIM / WARP_SIZE;  // K elements Per Thread = 4
+constexpr int K_DIM = 128;
+constexpr int V_DIM = 128;
+constexpr int WARP_SIZE = 32;
+constexpr int BV = 4;
+constexpr int NUM_WARPS = 4;
+constexpr int BV_TOTAL = NUM_WARPS * BV;  // 16 v-rows per block
+constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;  // 128 threads
+constexpr int KPT = K_DIM / WARP_SIZE;   // 4
 
 __device__ __forceinline__ float softplus_f(float x) {
     return (x > 20.0f) ? x : __logf(1.0f + __expf(x));
@@ -56,7 +43,6 @@ __device__ __forceinline__ float sigmoid_f(float x) {
     return 1.0f / (1.0f + __expf(-x));
 }
 
-// Full warp reduction: sum across 32 lanes
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -66,34 +52,30 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 
 __global__ void deltanet_recurrent_kernel(
-    // Input vectors
-    const __nv_bfloat16* __restrict__ Q,       // [B, 1, H, K]   bf16
-    const __nv_bfloat16* __restrict__ K_in,    // [B, 1, H, K]   bf16
-    const __nv_bfloat16* __restrict__ V_in,    // [B, 1, HV, V]  bf16
-    // Raw gate parameters
-    const float* __restrict__ A_log,           // [HV]           f32
-    const __nv_bfloat16* __restrict__ A,       // [B, 1, HV]     bf16
-    const float* __restrict__ Dt_bias,         // [HV]           f32
-    const __nv_bfloat16* __restrict__ B_gate,  // [B, 1, HV]     bf16
-    // State
-    const float* __restrict__ S,               // [B, HV, V, K]  f32 input
-    float* __restrict__ New_S,                 // [B, HV, V, K]  f32 output
-    // Output
-    __nv_bfloat16* __restrict__ O,             // [B, 1, HV, V]  bf16
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ K_in,
+    const __nv_bfloat16* __restrict__ V_in,
+    const float* __restrict__ A_log,
+    const __nv_bfloat16* __restrict__ A,
+    const float* __restrict__ Dt_bias,
+    const __nv_bfloat16* __restrict__ B_gate,
+    const float* __restrict__ S,
+    float* __restrict__ New_S,
+    __nv_bfloat16* __restrict__ O,
     float scale,
     int H,
     int HV
 ) {
-    // Grid: (NV, B * HV)
-    const int i_v = blockIdx.x;                    // which V-block
-    const int bh = blockIdx.y;                     // batch_id * HV + v_head_id
+    const int i_vb = blockIdx.x;
+    const int bh = blockIdx.y;
     const int batch_id = bh / HV;
     const int v_head_id = bh % HV;
-    const int head_id = v_head_id / (HV / H);     // GQA mapping
+    const int head_id = v_head_id / (HV / H);
 
-    const int tid = threadIdx.x;  // 0..31
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane_id = threadIdx.x % WARP_SIZE;
 
-    // ===== In-kernel gate/beta computation (fused, all threads compute same scalar) =====
+    // ===== Gate/beta computation =====
     const float a_val = __bfloat162float(A[batch_id * HV + v_head_id]);
     const float dt_bias_val = Dt_bias[v_head_id];
     const float a_log_val = A_log[v_head_id];
@@ -105,103 +87,113 @@ __global__ void deltanet_recurrent_kernel(
     const float decay = __expf(log_decay);
     const float beta = sigmoid_f(b_val);
 
-    // ===== Load q[K] and k[K] into shared memory (cooperative) =====
-    __shared__ float s_q[K_DIM];
-    __shared__ float s_k[K_DIM];
-
+    // ===== Load q, k per-warp via uint2 (64-bit) =====
     const __nv_bfloat16* q_base = Q + batch_id * (H * K_DIM) + head_id * K_DIM;
     const __nv_bfloat16* k_base = K_in + batch_id * (H * K_DIM) + head_id * K_DIM;
 
-    // 32 threads load 128 elements: 4 per thread, fully coalesced
-    #pragma unroll
-    for (int i = 0; i < KPT; i++) {
-        const int idx = tid * KPT + i;
-        s_q[idx] = __bfloat162float(q_base[idx]) * scale;
-        s_k[idx] = __bfloat162float(k_base[idx]);
+    float r_q[KPT], r_k[KPT];
+    {
+        const uint2* q_u2 = reinterpret_cast<const uint2*>(q_base);
+        const uint2* k_u2 = reinterpret_cast<const uint2*>(k_base);
+        uint2 q_packed = q_u2[lane_id];
+        uint2 k_packed = k_u2[lane_id];
+        const __nv_bfloat162* q_bf2 = reinterpret_cast<const __nv_bfloat162*>(&q_packed);
+        const __nv_bfloat162* k_bf2 = reinterpret_cast<const __nv_bfloat162*>(&k_packed);
+        r_q[0] = __bfloat162float(q_bf2[0].x) * scale;
+        r_q[1] = __bfloat162float(q_bf2[0].y) * scale;
+        r_q[2] = __bfloat162float(q_bf2[1].x) * scale;
+        r_q[3] = __bfloat162float(q_bf2[1].y) * scale;
+        r_k[0] = __bfloat162float(k_bf2[0].x);
+        r_k[1] = __bfloat162float(k_bf2[0].y);
+        r_k[2] = __bfloat162float(k_bf2[1].x);
+        r_k[3] = __bfloat162float(k_bf2[1].y);
     }
-    // Single warp — no __syncthreads needed
 
-    // ===== State base pointers =====
+    // ===== Pointers =====
     const int s_head_offset = batch_id * (HV * V_DIM * K_DIM) + v_head_id * (V_DIM * K_DIM);
+    const int v_head_base = batch_id * (HV * V_DIM) + v_head_id * V_DIM;
+    const int v_base = i_vb * BV_TOTAL + warp_id * BV;
 
-    // ===== Process BV v-rows, each thread handles KPT=4 K-elements per row =====
-    float s_regs[BV][KPT];  // BV * KPT = 4 * 4 = 16 f32 registers per thread
+    // ===== Load state via float4 + decay =====
+    float s_regs[BV][KPT];
 
-    // Load BV v-values
+    #pragma unroll
+    for (int r = 0; r < BV; r++) {
+        const int v_idx = v_base + r;
+        if (v_idx < V_DIM) {
+            const float4* s_row_f4 = reinterpret_cast<const float4*>(
+                S + s_head_offset + v_idx * K_DIM);
+            float4 tmp = s_row_f4[lane_id];
+            s_regs[r][0] = tmp.x * decay;
+            s_regs[r][1] = tmp.y * decay;
+            s_regs[r][2] = tmp.z * decay;
+            s_regs[r][3] = tmp.w * decay;
+        } else {
+            #pragma unroll
+            for (int i = 0; i < KPT; i++) s_regs[r][i] = 0.0f;
+        }
+    }
+
+    // ===== Load v via uint2 (64-bit) =====
     float v_vals[BV];
-
-    #pragma unroll
-    for (int r = 0; r < BV; r++) {
-        const int v_idx = i_v * BV + r;
-        if (v_idx < V_DIM) {
-            v_vals[r] = __bfloat162float(V_in[batch_id * (HV * V_DIM) + v_head_id * V_DIM + v_idx]);
-        } else {
-            v_vals[r] = 0.0f;
-        }
-    }
-
-    // Load state rows [BV][KPT] + apply decay
-    #pragma unroll
-    for (int r = 0; r < BV; r++) {
-        const int v_idx = i_v * BV + r;
-        const float* s_row_base = S + s_head_offset + v_idx * K_DIM;
-        if (v_idx < V_DIM) {
-            #pragma unroll
-            for (int i = 0; i < KPT; i++) {
-                s_regs[r][i] = s_row_base[tid * KPT + i] * decay;  // ① Gate decay
-            }
+    {
+        const int vb_idx = v_head_base + v_base;
+        if (v_base + BV <= V_DIM) {
+            const uint2* v_u2 = reinterpret_cast<const uint2*>(V_in + vb_idx);
+            uint2 v_packed = v_u2[0];
+            const __nv_bfloat162* v_bf2 = reinterpret_cast<const __nv_bfloat162*>(&v_packed);
+            v_vals[0] = __bfloat162float(v_bf2[0].x);
+            v_vals[1] = __bfloat162float(v_bf2[0].y);
+            v_vals[2] = __bfloat162float(v_bf2[1].x);
+            v_vals[3] = __bfloat162float(v_bf2[1].y);
         } else {
             #pragma unroll
-            for (int i = 0; i < KPT; i++) {
-                s_regs[r][i] = 0.0f;
+            for (int r = 0; r < BV; r++) {
+                const int v_idx = v_base + r;
+                v_vals[r] = (v_idx < V_DIM)
+                    ? __bfloat162float(V_in[vb_idx + r]) : 0.0f;
             }
         }
     }
 
-    // ===== ②③④ Delta rule for each v-row =====
+    // ===== Delta rule =====
     #pragma unroll
     for (int r = 0; r < BV; r++) {
-        // ② S^T @ k: partial dot product, then warp reduce
         float partial_stk = 0.0f;
         #pragma unroll
-        for (int i = 0; i < KPT; i++) {
-            partial_stk += s_regs[r][i] * s_k[tid * KPT + i];
+        for (int j = 0; j < KPT; j++) {
+            partial_stk += s_regs[r][j] * r_k[j];
         }
-        float stk = warp_reduce_sum(partial_stk);  // broadcast to all lanes
-
-        // ③ Delta rule: delta = beta * (v - stk)
+        float stk = warp_reduce_sum(partial_stk);
         float delta = beta * (v_vals[r] - stk);
-
-        // ④ Rank-1 update: s_row[j] += delta * k[j]
         #pragma unroll
-        for (int i = 0; i < KPT; i++) {
-            s_regs[r][i] += delta * s_k[tid * KPT + i];
+        for (int j = 0; j < KPT; j++) {
+            s_regs[r][j] += delta * r_k[j];
         }
     }
 
-    // ===== Store updated state + compute output =====
+    // ===== Store state via float4 + compute output =====
     #pragma unroll
     for (int r = 0; r < BV; r++) {
-        const int v_idx = i_v * BV + r;
+        const int v_idx = v_base + r;
         if (v_idx < V_DIM) {
-            // Store state row
-            float* new_s_row = New_S + s_head_offset + v_idx * K_DIM;
-            #pragma unroll
-            for (int i = 0; i < KPT; i++) {
-                new_s_row[tid * KPT + i] = s_regs[r][i];
-            }
+            float4* dst_f4 = reinterpret_cast<float4*>(
+                New_S + s_head_offset + v_idx * K_DIM);
+            float4 out_f4;
+            out_f4.x = s_regs[r][0];
+            out_f4.y = s_regs[r][1];
+            out_f4.z = s_regs[r][2];
+            out_f4.w = s_regs[r][3];
+            dst_f4[lane_id] = out_f4;
 
-            // ⑤ Output: o = dot(s_row, q), partial then warp reduce
             float partial_o = 0.0f;
             #pragma unroll
-            for (int i = 0; i < KPT; i++) {
-                partial_o += s_regs[r][i] * s_q[tid * KPT + i];
+            for (int j = 0; j < KPT; j++) {
+                partial_o += s_regs[r][j] * r_q[j];
             }
             float o_val = warp_reduce_sum(partial_o);
-
-            // Only lane 0 writes output
-            if (tid == 0) {
-                O[batch_id * (HV * V_DIM) + v_head_id * V_DIM + v_idx] = __float2bfloat16(o_val);
+            if (lane_id == 0) {
+                O[v_head_base + v_idx] = __float2bfloat16(o_val);
             }
         }
     }
@@ -224,28 +216,22 @@ void DeltaNetRecurrentForward(
     tvm::ffi::TensorView output,    // [B, T, HV, V]  bf16 (DPS pre-allocated)
     tvm::ffi::TensorView new_state  // [B, HV, V, K]  f32  (DPS pre-allocated)
 ) {
-    // Extract dimensions
     const int B = static_cast<int>(q.size(0));
     const int H = static_cast<int>(q.size(2));
     const int HV = static_cast<int>(v.size(2));
     const int V_val = static_cast<int>(v.size(3));
 
-    const int NV = (V_val + BV - 1) / BV;
+    const int NV_BLOCKS = (V_val + BV_TOTAL - 1) / BV_TOTAL;
 
     // Get CUDA stream from TVM FFI environment
     DLDevice dev = q.device();
     cudaStream_t stream = static_cast<cudaStream_t>(
         TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
-    // Grid and block dimensions
-    dim3 grid(NV, B * HV);
-    dim3 block(WARP_SIZE);  // 32 threads = 1 warp
+    dim3 grid(NV_BLOCKS, B * HV);
+    dim3 block(BLOCK_SIZE);
 
-    // Shared memory: s_q[128] + s_k[128] = 1024 bytes
-    size_t smem_size = 2 * K_DIM * sizeof(float);
-
-    // Launch kernel on the TVM-managed stream
-    deltanet_recurrent_kernel<<<grid, block, smem_size, stream>>>(
+    deltanet_recurrent_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),

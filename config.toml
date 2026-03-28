@@ -1,8 +1,8 @@
 [solution]
 name = "wufang-solution-v1"      # Solution name
-definition = "gdn_decode_qk4_v8_d128_k_last"          # Track: fused_moe | sparse_attention | gated_delta_net
+definition = "gdn_prefill_qk4_v8_d128_k_last"          # Track: fused_moe | sparse_attention | gated_delta_net
 author = "wufang"              # Team/author name
 
 [build]
-language = "cuda"                 # triton | cuda
-entry_point = "kernel.cu::kernel"  # TVM FFI export: file::function_name
+language = "triton"                 # triton | cuda
+entry_point = "kernel.py::kernel"  # TVM FFI export: file::function_name

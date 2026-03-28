@@ -40,6 +40,7 @@ def pack_solution(output_path: Path = None) -> Path:
 
     language = build_config["language"]
     entry_point = build_config["entry_point"]
+    binding = build_config.get("binding", None)
 
     # Determine source directory based on language
     if language == "triton":
@@ -53,11 +54,14 @@ def pack_solution(output_path: Path = None) -> Path:
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
     # Create build spec
-    spec = BuildSpec(
+    spec_kwargs = dict(
         language=language,
         target_hardware=["cuda"],
         entry_point=entry_point,
     )
+    if binding is not None:
+        spec_kwargs["binding"] = binding
+    spec = BuildSpec(**spec_kwargs)
 
     # Pack the solution
     solution = pack_solution_from_files(
